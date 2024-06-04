@@ -1,5 +1,5 @@
 <template>
-  <v-app id="app" v-if="dataLoaded">
+  <vn-app v-if="dataLoaded">
     <div class="wrap" v-if="!isInstallSuccess && !isInstallError">
       <div class="title">
         {{ getText('pageContent_installTitle') }}
@@ -59,18 +59,18 @@
         {{ getText('buttonLabel_goBack') }}
       </vn-button>
     </div>
-  </v-app>
+  </vn-app>
 </template>
 
 <script>
-import {Button, TextField} from 'vueton';
+import {App, Button, TextField} from 'vueton';
 
-import storage from 'storage/storage';
 import {pingClientApp} from 'utils/app';
 import {getText} from 'utils/common';
 
 export default {
   components: {
+    [App.name]: App,
     [Button.name]: Button,
     [TextField.name]: TextField
   },
@@ -135,10 +135,11 @@ export default {
         data.append('session', this.session);
 
         await fetch(`${this.apiUrl}/setup/close`, {
-          mode: 'cors',
           method: 'POST',
           body: data
         });
+
+        await browser.runtime.sendMessage({id: 'clientAppInstall'});
       }
     },
 
@@ -149,7 +150,6 @@ export default {
       data.append('targetEnv', this.$env.targetEnv);
 
       const rsp = await fetch(`${this.apiUrl}/setup/location`, {
-        mode: 'cors',
         method: 'POST',
         body: data
       });
@@ -174,14 +174,12 @@ export default {
       data.append('extension', this.getExtensionId());
 
       const rsp = await fetch(`${this.apiUrl}/setup/install`, {
-        mode: 'cors',
         method: 'POST',
         body: data
       });
 
       if (rsp.status === 200) {
         await pingClientApp();
-        await storage.set({simulateUserInput: true});
 
         this.isInstallSuccess = true;
       } else {

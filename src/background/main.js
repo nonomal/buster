@@ -1,38 +1,45 @@
-import audioBufferToWav from 'audiobuffer-to-wav';
 import aes from 'crypto-js/aes';
 import sha256 from 'crypto-js/sha256';
 import utf8 from 'crypto-js/enc-utf8';
 
-import {initStorage, migrateLegacyStorage} from 'storage/init';
+import {initStorage} from 'storage/init';
 import {isStorageReady} from 'storage/storage';
 import storage from 'storage/storage';
 import {
   showNotification,
   sendNativeMessage,
   processMessageResponse,
-  processAppUse
+  processAppUse,
+  showOptionsPage,
+  setAppVersion,
+  getStartupState,
+  insertBaseModule
 } from 'utils/app';
 import {
-  executeCode,
+  executeScript,
   scriptsAllowed,
+  isValidTab,
   getBrowser,
   getPlatform,
+  getExtensionDomain,
   getRandomInt,
   arrayBufferToBase64,
-  normalizeAudio,
-  sliceAudio
+  base64ToArrayBuffer,
+  prepareAudio,
+  setupOffscreenDocument,
+  sendOffscreenMessage,
+  runOnce
 } from 'utils/common';
 import {
-  recaptchaChallengeUrlRx,
+  recaptchaUrlRxString,
   captchaGoogleSpeechApiLangCodes,
   captchaIbmSpeechApiLangCodes,
   captchaMicrosoftSpeechApiLangCodes,
   captchaWitSpeechApiLangCodes
 } from 'utils/data';
-import {targetEnv, clientAppVersion} from 'utils/config';
+import {targetEnv, clientAppVersion, mv3} from 'utils/config';
 
 let nativePort;
-let secrets;
 
 function getFrameClientPos(index) {
   let currentIndex = -1;
@@ -72,11 +79,13 @@ async function getFramePos(tabId, frameId, frameIndex) {
       break;
     }
 
-    const [data] = await executeCode(
-      `(${getFrameClientPos.toString()})(${frameIndex})`,
+    const [data] = await executeScript({
+      func: getFrameClientPos,
+      args: [frameIndex],
+      code: `(${getFrameClientPos.toString()})(${frameIndex})`,
       tabId,
-      frameId
-    );
+      frameIds: [frameId]
+    });
 
     frameIndex = data.currentIndex;
     x += data.x;
@@ -120,12 +129,17 @@ async function resetCaptcha(tabId, frameId, challengeUrl) {
   frameId = (await browser.webNavigation.getFrame({tabId, frameId}))
     .parentFrameId;
 
-  if (!(await scriptsAllowed(tabId, frameId))) {
+  if (!(await scriptsAllowed({tabId, frameId}))) {
     await showNotification({messageId: 'error_scriptsNotAllowed'});
     return;
   }
 
-  await executeCode(`(${initResetCaptcha.toString()})()`, tabId, frameId);
+  await executeScript({
+    func: initResetCaptcha,
+    code: `(${initResetCaptcha.toString()})()`,
+    tabId,
+    frameIds: [frameId]
+  });
 
   await browser.tabs.sendMessage(
     tabId,
@@ -151,134 +165,244 @@ async function setChallengeLocale() {
     'simulateUserInput'
   ]);
 
-  if (loadEnglishChallenge || simulateUserInput) {
-    if (
-      !browser.webRequest.onBeforeRequest.hasListener(challengeRequestCallback)
+  if (mv3) {
+    if (loadEnglishChallenge || simulateUserInput) {
+      await browser.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [1],
+        addRules: [
+          {
+            id: 1,
+            action: {
+              type: 'redirect',
+              redirect: {
+                transform: {
+                  queryTransform: {
+                    addOrReplaceParams: [{key: 'hl', value: 'en'}]
+                  }
+                }
+              }
+            },
+            condition: {
+              regexFilter: recaptchaUrlRxString,
+              resourceTypes: ['sub_frame']
+            }
+          }
+        ]
+      });
+    } else {
+      await browser.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [1]
+      });
+    }
+  } else {
+    if (loadEnglishChallenge || simulateUserInput) {
+      if (
+        !browser.webRequest.onBeforeRequest.hasListener(
+          challengeRequestCallback
+        )
+      ) {
+        browser.webRequest.onBeforeRequest.addListener(
+          challengeRequestCallback,
+          {
+            urls: [
+              'https://google.com/recaptcha/api2/anchor*',
+              'https://google.com/recaptcha/api2/bframe*',
+              'https://www.google.com/recaptcha/api2/anchor*',
+              'https://www.google.com/recaptcha/api2/bframe*',
+              'https://google.com/recaptcha/enterprise/anchor*',
+              'https://google.com/recaptcha/enterprise/bframe*',
+              'https://www.google.com/recaptcha/enterprise/anchor*',
+              'https://www.google.com/recaptcha/enterprise/bframe*',
+              'https://recaptcha.net/recaptcha/api2/anchor*',
+              'https://recaptcha.net/recaptcha/api2/bframe*',
+              'https://www.recaptcha.net/recaptcha/api2/anchor*',
+              'https://www.recaptcha.net/recaptcha/api2/bframe*',
+              'https://recaptcha.net/recaptcha/enterprise/anchor*',
+              'https://recaptcha.net/recaptcha/enterprise/bframe*',
+              'https://www.recaptcha.net/recaptcha/enterprise/anchor*',
+              'https://www.recaptcha.net/recaptcha/enterprise/bframe*'
+            ],
+            types: ['sub_frame']
+          },
+          ['blocking']
+        );
+      }
+    } else if (
+      browser.webRequest.onBeforeRequest.hasListener(challengeRequestCallback)
     ) {
-      browser.webRequest.onBeforeRequest.addListener(
-        challengeRequestCallback,
-        {
-          urls: [
-            'https://google.com/recaptcha/api2/anchor*',
-            'https://google.com/recaptcha/api2/bframe*',
-            'https://www.google.com/recaptcha/api2/anchor*',
-            'https://www.google.com/recaptcha/api2/bframe*',
-            'https://google.com/recaptcha/enterprise/anchor*',
-            'https://google.com/recaptcha/enterprise/bframe*',
-            'https://www.google.com/recaptcha/enterprise/anchor*',
-            'https://www.google.com/recaptcha/enterprise/bframe*',
-            'https://recaptcha.net/recaptcha/api2/anchor*',
-            'https://recaptcha.net/recaptcha/api2/bframe*',
-            'https://www.recaptcha.net/recaptcha/api2/anchor*',
-            'https://www.recaptcha.net/recaptcha/api2/bframe*',
-            'https://recaptcha.net/recaptcha/enterprise/anchor*',
-            'https://recaptcha.net/recaptcha/enterprise/bframe*',
-            'https://www.recaptcha.net/recaptcha/enterprise/anchor*',
-            'https://www.recaptcha.net/recaptcha/enterprise/bframe*'
-          ],
-          types: ['sub_frame']
-        },
-        ['blocking']
+      browser.webRequest.onBeforeRequest.removeListener(
+        challengeRequestCallback
       );
     }
-  } else if (
-    browser.webRequest.onBeforeRequest.hasListener(challengeRequestCallback)
-  ) {
-    browser.webRequest.onBeforeRequest.removeListener(challengeRequestCallback);
   }
 }
 
-function removeRequestOrigin(details) {
-  const origin = window.location.origin;
+function removeRequestHeaders(details) {
   const headers = details.requestHeaders;
-  for (const header of headers) {
-    if (header.name.toLowerCase() === 'origin' && header.value === origin) {
-      headers.splice(headers.indexOf(header), 1);
-      break;
+
+  const isBackgroundRequest = headers.some(
+    header =>
+      header.name.toLowerCase() === 'origin' &&
+      header.value === self.location.origin
+  );
+
+  if (isBackgroundRequest) {
+    for (const header of headers) {
+      const name = header.name.toLowerCase();
+
+      if (name === 'origin' || name === 'referer') {
+        headers.splice(headers.indexOf(header), 1);
+      }
     }
   }
 
   return {requestHeaders: headers};
 }
 
-function addBackgroundRequestListener() {
-  if (
-    !browser.webRequest.onBeforeSendHeaders.hasListener(removeRequestOrigin)
-  ) {
-    const urls = [
-      'https://google.com/*',
-      'https://www.google.com/*',
-      'https://recaptcha.net/*',
-      'https://www.recaptcha.net/*',
-      'https://api.wit.ai/*',
-      'https://speech.googleapis.com/*',
-      'https://*.speech-to-text.watson.cloud.ibm.com/*',
-      'https://*.stt.speech.microsoft.com/*'
-    ];
+async function addBackgroundRequestListener() {
+  const ruleIds = [2];
 
-    const extraInfo = ['blocking', 'requestHeaders'];
+  if (mv3) {
+    await browser.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: ruleIds,
+      addRules: [
+        {
+          id: ruleIds[0],
+          action: {
+            type: 'modifyHeaders',
+            requestHeaders: [
+              {operation: 'remove', header: 'Origin'},
+              {operation: 'remove', header: 'Referer'}
+            ]
+          },
+          condition: {
+            // https://google.com/*
+            // https://www.google.com/*
+            // https://recaptcha.net/*
+            // https://www.recaptcha.net/*
+            // https://api.wit.ai/*
+            // https://speech.googleapis.com/*
+            // https://iam.cloud.ibm.com/*
+            // https://*.speech-to-text.watson.cloud.ibm.com/*
+            // wss://*.speech-to-text.watson.cloud.ibm.com/*
+            // https://*.stt.speech.microsoft.com/*
+            requestDomains: [
+              'google.com',
+              'recaptcha.net',
+              'api.wit.ai',
+              'speech.googleapis.com',
+              'iam.cloud.ibm.com',
+              'speech-to-text.watson.cloud.ibm.com',
+              'stt.speech.microsoft.com'
+            ],
+            initiatorDomains: [getExtensionDomain()],
+            resourceTypes: ['websocket', 'xmlhttprequest']
+          }
+        }
+      ]
+    });
+
+    return ruleIds;
+  } else {
     if (
-      targetEnv !== 'firefox' &&
-      Object.values(browser.webRequest.OnBeforeSendHeadersOptions).includes(
-        'extraHeaders'
-      )
+      !browser.webRequest.onBeforeSendHeaders.hasListener(removeRequestHeaders)
     ) {
-      extraInfo.push('extraHeaders');
+      const urls = [
+        'https://google.com/*',
+        'https://www.google.com/*',
+        'https://recaptcha.net/*',
+        'https://www.recaptcha.net/*',
+        'https://api.wit.ai/*',
+        'https://speech.googleapis.com/*',
+        '*://*.speech-to-text.watson.cloud.ibm.com/*',
+        'https://iam.cloud.ibm.com/*',
+        'https://*.stt.speech.microsoft.com/*'
+      ];
+
+      const extraInfo = ['blocking', 'requestHeaders'];
+      if (
+        targetEnv !== 'firefox' &&
+        Object.values(browser.webRequest.OnBeforeSendHeadersOptions).includes(
+          'extraHeaders'
+        )
+      ) {
+        extraInfo.push('extraHeaders');
+      }
+
+      browser.webRequest.onBeforeSendHeaders.addListener(
+        removeRequestHeaders,
+        {
+          urls,
+          types: ['websocket', 'xmlhttprequest']
+        },
+        extraInfo
+      );
     }
-
-    browser.webRequest.onBeforeSendHeaders.addListener(
-      removeRequestOrigin,
-      {
-        urls,
-        types: ['xmlhttprequest']
-      },
-      extraInfo
-    );
   }
 }
 
-function removeBackgroundRequestListener() {
-  if (browser.webRequest.onBeforeSendHeaders.hasListener(removeRequestOrigin)) {
-    browser.webRequest.onBeforeSendHeaders.removeListener(removeRequestOrigin);
+async function removeBackgroundRequestListener({ruleIds = null} = {}) {
+  if (mv3) {
+    await browser.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: ruleIds
+    });
+  } else {
+    if (
+      browser.webRequest.onBeforeSendHeaders.hasListener(removeRequestHeaders)
+    ) {
+      browser.webRequest.onBeforeSendHeaders.removeListener(
+        removeRequestHeaders
+      );
+    }
   }
 }
 
-async function prepareAudio(audio) {
-  const audioBuffer = await normalizeAudio(audio);
-
-  const audioSlice = await sliceAudio({
-    audioBuffer,
-    start: 1.5,
-    end: audioBuffer.duration - 1.5
-  });
-
-  return audioBufferToWav(audioSlice);
-}
-
+let secrets;
 async function loadSecrets() {
+  if (mv3) {
+    const {secrets: data} = await storage.get('secrets', {area: 'session'});
+    if (data) {
+      return data;
+    }
+  } else {
+    if (secrets) {
+      return secrets;
+    }
+  }
+
+  let data;
+
   try {
     const ciphertext = await (await fetch('/secrets.txt')).text();
 
     const key = sha256(
       (await (await fetch('/src/background/script.js')).text()) +
-        (await (await fetch('/src/solve/script.js')).text())
+        (await (await fetch('/src/base/script.js')).text())
     ).toString();
 
-    secrets = JSON.parse(aes.decrypt(ciphertext, key).toString(utf8));
+    data = JSON.parse(aes.decrypt(ciphertext, key).toString(utf8));
   } catch (err) {
-    secrets = {};
     const {speechService} = await storage.get('speechService');
     if (speechService === 'witSpeechApiDemo') {
       await storage.set({speechService: 'witSpeechApi'});
     }
+
+    data = {};
+  } finally {
+    if (mv3) {
+      await storage.set({secrets: data}, {area: 'session'});
+    } else {
+      secrets = data;
+    }
   }
+
+  return data;
 }
 
 async function getWitSpeechApiKey(speechService, language) {
   if (speechService === 'witSpeechApiDemo') {
-    if (!secrets) {
-      await loadSecrets();
-    }
+    const secrets = await loadSecrets();
+
     const apiKeys = secrets.witApiKeys;
     if (apiKeys) {
       const apiKey = apiKeys[language];
@@ -296,13 +420,13 @@ async function getWitSpeechApiKey(speechService, language) {
 async function getWitSpeechApiResult(apiKey, audioContent) {
   const result = {};
 
-  const rsp = await fetch('https://api.wit.ai/speech?v=20221114', {
-    mode: 'cors',
+  const rsp = await fetch('https://api.wit.ai/speech?v=20240304', {
     method: 'POST',
     headers: {
       Authorization: 'Bearer ' + apiKey
     },
-    body: new Blob([audioContent], {type: 'audio/wav'})
+    body: new Blob([audioContent], {type: 'audio/wav'}),
+    credentials: 'omit'
   });
 
   if (rsp.status !== 200) {
@@ -348,9 +472,9 @@ async function getGoogleSpeechApiResult(
   const rsp = await fetch(
     `https://speech.googleapis.com/v1p1beta1/speech:recognize?key=${apiKey}`,
     {
-      mode: 'cors',
       method: 'POST',
-      body: JSON.stringify(data)
+      body: JSON.stringify(data),
+      credentials: 'omit'
     }
   );
 
@@ -365,26 +489,122 @@ async function getGoogleSpeechApiResult(
 }
 
 async function getIbmSpeechApiResult(apiUrl, apiKey, audioContent, model) {
-  const rsp = await fetch(
-    `${apiUrl}/v1/recognize?model=${model}&profanity_filter=false`,
-    {
-      mode: 'cors',
+  // Issue:
+
+  // IBM HTTP API: response status 400 when Priority header is sent
+  // Error: could not convert string to float: 'u=4'
+
+  // Chrome 124 and Firefox 126 sets the Priority header for HTTP/2 requests,
+  // but it cannot be removed by the extension, declarativeNetRequest
+  // and webRequest do not see the header because it is set by the browser
+  // after request filtering occurs.
+
+  // Chrome accepts a custom Priority header value, but Firefox ignores it.
+
+  // IBM has a WebSocket API, but in Chrome declarativeNetRequest rules
+  // do not match WebSocket requests from background scripts,
+  // so the Origin header we remove for API calls would be exposed.
+
+  // Solution:
+
+  // The HTTP API is used in Chrome with an invalid Priority header value
+  // that can be converted to float, and the WebSocket API is used in Firefox.
+
+  if (targetEnv === 'firefox') {
+    const rsp = await fetch('https://iam.cloud.ibm.com/identity/token', {
       method: 'POST',
-      headers: {
-        Authorization: 'Basic ' + window.btoa('apikey:' + apiKey),
-        'X-Watson-Learning-Opt-Out': 'true'
-      },
-      body: new Blob([audioContent], {type: 'audio/wav'})
+      body: new URLSearchParams({
+        grant_type: 'urn:ibm:params:oauth:grant-type:apikey',
+        apikey: apiKey
+      }),
+      credentials: 'omit'
+    });
+
+    if (rsp.status !== 200) {
+      throw new Error(`API response: ${rsp.status}, ${await rsp.text()}`);
     }
-  );
 
-  if (rsp.status !== 200) {
-    throw new Error(`API response: ${rsp.status}, ${await rsp.text()}`);
-  }
+    const {access_token: accessToken} = await rsp.json();
+    const wsUrl = apiUrl.replace(/^https(.*)/, 'wss$1');
 
-  const results = (await rsp.json()).results;
-  if (results && results.length) {
-    return results[0].alternatives[0].transcript.trim();
+    const ws = new WebSocket(
+      `${wsUrl}/v1/recognize?access_token=${accessToken}&model=${model}&x-watson-learning-opt-out=true`
+    );
+
+    return await new Promise((resolve, reject) => {
+      const timeoutId = self.setTimeout(function () {
+        ws.close();
+        reject(new Error('API timeout'));
+      }, 30000); // 30 seconds
+
+      function response({result, error} = {}) {
+        self.clearTimeout(timeoutId);
+
+        if (error) {
+          reject(error);
+        } else {
+          resolve(result);
+        }
+      }
+
+      ws.onopen = function (ev) {
+        ws.send(
+          JSON.stringify({
+            action: 'start',
+            'content-type': 'audio/wav',
+            profanity_filter: false
+          })
+        );
+
+        ws.send(new Blob([audioContent]));
+
+        ws.send(JSON.stringify({action: 'stop'}));
+      };
+
+      ws.onmessage = function (ev) {
+        const results = JSON.parse(ev.data).results;
+
+        if (results) {
+          ws.close();
+
+          response({result: results[0]?.alternatives[0].transcript.trim()});
+        }
+      };
+
+      ws.onclose = function (ev) {
+        if (ev.code !== 1000) {
+          response({error: new Error(`API response: ${ev.code}`)});
+        }
+      };
+
+      ws.onerror = function (ev) {
+        response({error: new Error(`API response: ${ev.code}`)});
+      };
+    });
+  } else {
+    const rsp = await fetch(
+      `${apiUrl}/v1/recognize?model=${model}&profanity_filter=false`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Basic ' + self.btoa('apikey:' + apiKey),
+          'X-Watson-Learning-Opt-Out': 'true',
+          // Invalid value, see description above
+          Priority: '1'
+        },
+        body: new Blob([audioContent], {type: 'audio/wav'}),
+        credentials: 'omit'
+      }
+    );
+
+    if (rsp.status !== 200) {
+      throw new Error(`API response: ${rsp.status}, ${await rsp.text()}`);
+    }
+
+    const results = (await rsp.json()).results;
+    if (results && results.length) {
+      return results[0].alternatives[0].transcript.trim();
+    }
   }
 }
 
@@ -397,13 +617,13 @@ async function getMicrosoftSpeechApiResult(
   const rsp = await fetch(
     `https://${apiLocation}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=${language}&format=detailed&profanity=raw`,
     {
-      mode: 'cors',
       method: 'POST',
       headers: {
         'Ocp-Apim-Subscription-Key': apiKey,
         'Content-type': 'audio/wav; codec=audio/pcm; samplerate=16000'
       },
-      body: new Blob([audioContent], {type: 'audio/wav'})
+      body: new Blob([audioContent], {type: 'audio/wav'}),
+      credentials: 'omit'
     }
   );
 
@@ -418,10 +638,34 @@ async function getMicrosoftSpeechApiResult(
 }
 
 async function transcribeAudio(audioUrl, lang) {
-  let solution;
+  const audioBuffer = await (
+    await fetch(audioUrl, {credentials: 'omit'})
+  ).arrayBuffer();
 
-  const audioRsp = await fetch(audioUrl);
-  const audioContent = await prepareAudio(await audioRsp.arrayBuffer());
+  const audioOptions = {trimStart: 1.5, trimEnd: 1.5};
+
+  let audioContent;
+  if (mv3 && !['firefox', 'safari'].includes(targetEnv)) {
+    await setupOffscreenDocument({
+      url: '/src/offscreen/index.html',
+      reasons: ['USER_MEDIA'],
+      justification: 'process audio'
+    });
+
+    const {audioString} = await sendOffscreenMessage({
+      id: 'processAudio',
+      audioString: arrayBufferToBase64(audioBuffer),
+      audioOptions
+    });
+
+    await browser.offscreen.closeDocument();
+
+    audioContent = base64ToArrayBuffer(audioString);
+  } else {
+    audioContent = await prepareAudio(audioBuffer, audioOptions);
+  }
+
+  let solution;
 
   const {speechService, tryEnglishSpeechModel} = await storage.get([
     'speechService',
@@ -467,9 +711,8 @@ async function transcribeAudio(audioUrl, lang) {
       solution = result.text;
     }
   } else if (speechService === 'googleSpeechApi') {
-    const {googleSpeechApiKey: apiKey} = await storage.get(
-      'googleSpeechApiKey'
-    );
+    const {googleSpeechApiKey: apiKey} =
+      await storage.get('googleSpeechApiKey');
 
     if (!apiKey) {
       showNotification({messageId: 'error_missingApiKey'});
@@ -548,7 +791,7 @@ async function transcribeAudio(audioUrl, lang) {
     if (['witSpeechApiDemo', 'witSpeechApi'].includes(speechService)) {
       showNotification({
         messageId: 'error_captchaNotSolvedWitai',
-        timeout: 60000
+        timeout: 20000
       });
     } else {
       showNotification({messageId: 'error_captchaNotSolved', timeout: 6000});
@@ -559,6 +802,19 @@ async function transcribeAudio(audioUrl, lang) {
 }
 
 async function processMessage(request, sender) {
+  // Samsung Internet 13: extension messages are sometimes also dispatched
+  // to the sender frame.
+  if (sender.url === self.location.href) {
+    return;
+  }
+
+  if (targetEnv === 'samsung') {
+    if (await isValidTab({tab: sender.tab})) {
+      // Samsung Internet 13: runtime.onMessage provides wrong tab index.
+      sender.tab = await browser.tabs.get(sender.tab.id);
+    }
+  }
+
   if (request.id === 'notification') {
     showNotification({
       message: request.message,
@@ -570,11 +826,11 @@ async function processMessage(request, sender) {
   } else if (request.id === 'captchaSolved') {
     await processAppUse();
   } else if (request.id === 'transcribeAudio') {
-    addBackgroundRequestListener();
+    const ruleIds = await addBackgroundRequestListener();
     try {
       return await transcribeAudio(request.audioUrl, request.lang);
     } finally {
-      removeBackgroundRequestListener();
+      await removeBackgroundRequestListener({ruleIds});
     }
   } else if (request.id === 'resetCaptcha') {
     await resetCaptcha(sender.tab.id, sender.frameId, request.challengeUrl);
@@ -583,13 +839,11 @@ async function processMessage(request, sender) {
   } else if (request.id === 'getOsScale') {
     let zoom = await browser.tabs.getZoom(sender.tab.id);
 
-    const [[scale, windowWidth]] = await browser.tabs.executeScript(
-      sender.tab.id,
-      {
-        code: `[window.devicePixelRatio, window.innerWidth];`,
-        runAt: 'document_start'
-      }
-    );
+    const [[scale, windowWidth]] = await executeScript({
+      func: () => [window.devicePixelRatio, window.innerWidth],
+      code: `[window.devicePixelRatio, window.innerWidth];`,
+      tabId: sender.tab.id
+    });
 
     if (targetEnv === 'firefox') {
       // https://bugzilla.mozilla.org/show_bug.cgi?id=1787649
@@ -638,13 +892,15 @@ async function processMessage(request, sender) {
     };
     return sendNativeMessage(nativePort, message);
   } else if (request.id === 'openOptions') {
-    browser.runtime.openOptionsPage();
+    await showOptionsPage();
   } else if (request.id === 'getPlatform') {
-    return getPlatform({fallback: false});
+    return getPlatform();
   } else if (request.id === 'getBrowser') {
     return getBrowser();
   } else if (request.id === 'optionChange') {
     await onOptionChange();
+  } else if (request.id === 'clientAppInstall') {
+    await onClientAppInstall();
   }
 }
 
@@ -654,60 +910,38 @@ function onMessage(request, sender, sendResponse) {
   return processMessageResponse(response, sendResponse);
 }
 
+async function onClientAppInstall() {
+  await storage.set({simulateUserInput: true});
+
+  await browser.runtime
+    .sendMessage({id: 'reloadOptionsPage'})
+    .catch(() => null);
+}
+
 async function onOptionChange() {
   await setChallengeLocale();
 }
 
 async function onActionButtonClick(tab) {
-  await browser.runtime.openOptionsPage();
+  await showOptionsPage();
 }
 
 async function onInstall(details) {
-  if (
-    ['chrome', 'edge', 'opera'].includes(targetEnv) &&
-    ['install', 'update'].includes(details.reason)
-  ) {
-    const tabs = await browser.tabs.query({
-      url: ['http://*/*', 'https://*/*'],
-      windowType: 'normal'
-    });
-
-    for (const tab of tabs) {
-      const tabId = tab.id;
-
-      const frames = await browser.webNavigation.getAllFrames({tabId});
-      for (const frame of frames) {
-        const frameId = frame.frameId;
-
-        if (frameId && recaptchaChallengeUrlRx.test(frame.url)) {
-          await browser.tabs.insertCSS(tabId, {
-            frameId,
-            runAt: 'document_idle',
-            file: '/src/solve/style.css'
-          });
-
-          await browser.tabs.executeScript(tabId, {
-            frameId,
-            runAt: 'document_idle',
-            file: '/src/solve/script.js'
-          });
-        }
-      }
-    }
-
-    const setupTabs = await browser.tabs.query({
-      url: 'http://127.0.0.1/buster/setup?session=*',
-      windowType: 'normal'
-    });
-
-    for (const tab of setupTabs) {
-      await browser.tabs.reload(tab.id);
-    }
+  if (['install', 'update'].includes(details.reason)) {
+    await setup({event: 'install'});
   }
 }
 
-function addBrowserActionListener() {
-  browser.browserAction.onClicked.addListener(onActionButtonClick);
+async function onStartup() {
+  await setup({event: 'startup'});
+}
+
+function addActionListener() {
+  if (mv3) {
+    browser.action.onClicked.addListener(onActionButtonClick);
+  } else {
+    browser.browserAction.onClicked.addListener(onActionButtonClick);
+  }
 }
 
 function addMessageListener() {
@@ -718,19 +952,56 @@ function addInstallListener() {
   browser.runtime.onInstalled.addListener(onInstall);
 }
 
-async function setup() {
-  if (!(await isStorageReady())) {
-    await migrateLegacyStorage();
-    await initStorage();
+function addStartupListener() {
+  browser.runtime.onStartup.addListener(onStartup);
+}
+
+async function setup({event = ''} = {}) {
+  const startup = await getStartupState({event});
+
+  if (startup.setupInstance) {
+    await runOnce('setupInstance', async () => {
+      if (!(await isStorageReady())) {
+        await initStorage();
+      }
+
+      if (['chrome', 'edge', 'opera', 'samsung'].includes(targetEnv)) {
+        await insertBaseModule();
+      }
+
+      if (startup.install) {
+        const setupTabs = await browser.tabs.query({
+          url: 'http://127.0.0.1/buster/setup?session=*',
+          windowType: 'normal'
+        });
+
+        for (const tab of setupTabs) {
+          await browser.tabs.reload(tab.id);
+        }
+      }
+
+      if (startup.update) {
+        await setAppVersion();
+      }
+    });
   }
 
-  await setChallengeLocale();
+  if (startup.setupSession) {
+    await runOnce('setupSession', async () => {
+      if (mv3 && !(await isStorageReady({area: 'session'}))) {
+        await initStorage({area: 'session', silent: true});
+      }
+
+      await setChallengeLocale();
+    });
+  }
 }
 
 function init() {
-  addBrowserActionListener();
+  addActionListener();
   addMessageListener();
   addInstallListener();
+  addStartupListener();
 
   setup();
 }
